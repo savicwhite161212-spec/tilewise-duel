@@ -1,15 +1,19 @@
-// Tilewise sunucusu: isim, arkadaşlar, odalar (2-4 kişi), düello mesajları ve sıralama.
+// Tilewise sunucusu: isim, arkadaşlar, odalar (2-4 kişi), çok turlu düello ve puanlı sıralama.
 // Veriler bellekte tutulur; sunucu yeniden başlarsa silinir.
 const http = require('http');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
 const ROOM_MAX = 4;
+const ROUND_PTS = [100, 70, 50, 30]; // tur sıralaması puanı (1., 2., 3., 4.)
+const TIME_BONUS_MAX = 60;           // her saniye için 1 puan: 60 sn'den hızlı çözene ek puan
+const ROUND_CAP_MS = 180000;         // bir turda en fazla 3 dk beklenir
+const BETWEEN_MS = 7000;             // turlar arası bekleme
 const NAME_RE = /^[A-Za-zÇĞİÖŞÜçğıöşü0-9_]{2,12}$/;
 
 const users = new Map();  // key(küçük harf) -> { name, friends:Set, incoming:Set, outgoing:Set, score, streak, wins }
 const online = new Map(); // key -> ws
-const rooms = new Map();  // code -> { code, host, members:[key], started, seed, done:{key:ms} }
+const rooms = new Map();  // code -> { code, host, members:[key], started, between, seed, done:{key:ms}, rounds, round, totals:{key:puan} }
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -42,22 +46,69 @@ function notifyFriends(key) {
 }
 
 function roomState(room) {
-  return { t: 'room', code: room.code, host: nameOf(room.host), players: room.members.map(nameOf), started: room.started };
+  return { t: 'room', code: room.code, host: nameOf(room.host), players: room.members.map(nameOf), started: room.started, rounds: room.rounds, round: room.round };
 }
 function broadcastRoom(room) { room.members.forEach(k => sendKey(k, roomState(room))); }
 
-// Herkes bitirdiyse sıralamayı gönder ve galibiyeti kaydet
+function clearTimers(room) { clearTimeout(room.cap); clearTimeout(room.timer); }
+
+function startRound(room) {
+  clearTimers(room);
+  room.round++;
+  room.started = true; room.between = false; room.done = {};
+  room.seed = 1 + Math.floor(Math.random() * 2e9);
+  room.cap = setTimeout(() => {
+    if (!room.started || room.between) return;
+    room.members.forEach(k => { if (room.done[k] == null) room.done[k] = ROUND_CAP_MS; });
+    maybeFinish(room);
+  }, ROUND_CAP_MS + 5000);
+  const players = room.members.map(nameOf);
+  room.members.forEach(k => sendKey(k, { t: 'start', seed: room.seed, players, round: room.round, rounds: room.rounds }));
+  broadcastRoom(room);
+}
+
+// Oyun bitti: toplam puana göre son sıralama
+function finalize(room) {
+  clearTimers(room);
+  const ranks = room.members
+    .map(k => ({ key: k, name: nameOf(k), total: room.totals[k] || 0 }))
+    .sort((a, b) => b.total - a.total || (room.sumMs[a.key] || 0) - (room.sumMs[b.key] || 0));
+  if (ranks.length >= 2) { const u = users.get(ranks[0].key); if (u) u.wins++; }
+  const out = ranks.map(r => ({ name: r.name, total: r.total }));
+  room.members.forEach(k => sendKey(k, { t: 'result', ranks: out, rounds: room.rounds }));
+  room.started = false; room.between = false; room.round = 0; room.done = {}; room.totals = {}; room.sumMs = {};
+  broadcastRoom(room);
+}
+
+// Herkes turu bitirdiyse puanla; son tursa toplam sıralamayı gönder
 function maybeFinish(room) {
-  if (!room.started || room.members.length === 0) return;
+  if (!room.started || room.between || room.members.length === 0) return;
   if (!room.members.every(k => room.done[k] != null)) return;
+  clearTimeout(room.cap);
   const ranks = room.members
     .map(k => ({ key: k, name: nameOf(k), ms: room.done[k] }))
     .sort((a, b) => a.ms - b.ms);
-  if (ranks.length >= 2) { const u = users.get(ranks[0].key); if (u) u.wins++; }
-  const out = ranks.map(r => ({ name: r.name, ms: r.ms }));
-  room.members.forEach(k => sendKey(k, { t: 'result', ranks: out }));
-  room.started = false; room.done = {};
-  broadcastRoom(room);
+  ranks.forEach((r, i) => {
+    const bonus = Math.max(0, Math.round(TIME_BONUS_MAX - r.ms / 1000));
+    r.pts = (ROUND_PTS[i] != null ? ROUND_PTS[i] : 20) + bonus;
+    room.totals[r.key] = (room.totals[r.key] || 0) + r.pts;
+    room.sumMs[r.key] = (room.sumMs[r.key] || 0) + r.ms;
+    r.total = room.totals[r.key];
+  });
+  if (room.round >= room.rounds) {
+    // son turun sonucunu da göster, sonra toplam sıralama
+    const last = ranks.map(r => ({ name: r.name, ms: r.ms, pts: r.pts, total: r.total }));
+    room.members.forEach(k => sendKey(k, { t: 'round_result', round: room.round, rounds: room.rounds, ranks: last, next: 0 }));
+    return finalize(room);
+  }
+  room.between = true;
+  const out = ranks.map(r => ({ name: r.name, ms: r.ms, pts: r.pts, total: r.total }));
+  room.members.forEach(k => sendKey(k, { t: 'round_result', round: room.round, rounds: room.rounds, ranks: out, next: BETWEEN_MS / 1000 }));
+  room.timer = setTimeout(() => {
+    if (!rooms.has(room.code)) return;
+    if (room.members.length < 2) return finalize(room);
+    startRound(room);
+  }, BETWEEN_MS);
 }
 
 function leaveRoom(ws) {
@@ -70,10 +121,11 @@ function leaveRoom(ws) {
       sendKey(k, { t: 'room_closed', msg: 'Oda kurucusu odadan ayrıldı, oda kapandı.' });
       const w = online.get(k); if (w) w.room = null;
     });
+    clearTimers(room);
     rooms.delete(code);
     return;
   }
-  delete room.done[ws.key];
+  delete room.done[ws.key]; delete room.totals[ws.key];
   broadcastRoom(room);
   maybeFinish(room);
 }
@@ -158,7 +210,7 @@ wss.on('connection', ws => {
       case 'create': {
         leaveRoom(ws);
         const code = newCode();
-        const room = { code, host: ws.key, members: [ws.key], started: false, seed: 0, done: {} };
+        const room = { code, host: ws.key, members: [ws.key], started: false, between: false, seed: 0, done: {}, rounds: 3, round: 0, totals: {}, sumMs: {} };
         rooms.set(code, room);
         ws.room = code;
         return broadcastRoom(room);
@@ -189,19 +241,17 @@ wss.on('connection', ws => {
       case 'start': {
         const room = rooms.get(ws.room);
         if (!room || room.host !== ws.key) return send(ws, { t: 'error', msg: 'Oyunu sadece oda kurucusu başlatabilir.' });
+        if (room.started) return;
         if (room.members.length < 2) return send(ws, { t: 'error', msg: 'Başlamak için en az 2 kişi gerekli.' });
-        room.started = true;
-        room.done = {};
-        room.seed = 1 + Math.floor(Math.random() * 2e9);
-        const players = room.members.map(nameOf);
-        room.members.forEach(k => sendKey(k, { t: 'start', seed: room.seed, players }));
-        return broadcastRoom(room);
+        room.rounds = Math.min(10, Math.max(1, Math.floor(Number(m.rounds)) || 3));
+        room.round = 0; room.totals = {}; room.sumMs = {};
+        return startRound(room);
       }
       case 'relay': {
         const room = rooms.get(ws.room);
-        if (!room || !room.started) return;
+        if (!room || !room.started || room.between) return;
         room.members.forEach(k => { if (k !== ws.key) sendKey(k, { t: 'relay', from: me.name, data: m.data }); });
-        if (m.data && m.data.t === 'done') {
+        if (m.data && m.data.t === 'done' && room.done[ws.key] == null) {
           room.done[ws.key] = Number(m.data.ms) || 0;
           maybeFinish(room);
         }
