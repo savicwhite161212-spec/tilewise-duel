@@ -46,7 +46,7 @@ function notifyFriends(key) {
 }
 
 function roomState(room) {
-  return { t: 'room', code: room.code, host: nameOf(room.host), players: room.members.map(nameOf), started: room.started, rounds: room.rounds, round: room.round };
+  return { t: 'room', code: room.code, host: nameOf(room.host), players: room.members.map(nameOf), started: room.started, rounds: room.rounds, round: room.round, diff: room.diff };
 }
 function broadcastRoom(room) { room.members.forEach(k => sendKey(k, roomState(room))); }
 
@@ -63,7 +63,7 @@ function startRound(room) {
     maybeFinish(room);
   }, ROUND_CAP_MS + 5000);
   const players = room.members.map(nameOf);
-  room.members.forEach(k => sendKey(k, { t: 'start', seed: room.seed, players, round: room.round, rounds: room.rounds }));
+  room.members.forEach(k => sendKey(k, { t: 'start', seed: room.seed, players, round: room.round, rounds: room.rounds, diff: room.diff }));
   broadcastRoom(room);
 }
 
@@ -210,7 +210,7 @@ wss.on('connection', ws => {
       case 'create': {
         leaveRoom(ws);
         const code = newCode();
-        const room = { code, host: ws.key, members: [ws.key], started: false, between: false, seed: 0, done: {}, rounds: 3, round: 0, totals: {}, sumMs: {} };
+        const room = { code, host: ws.key, members: [ws.key], started: false, between: false, seed: 0, done: {}, rounds: 3, diff: 1, round: 0, totals: {}, sumMs: {} };
         rooms.set(code, room);
         ws.room = code;
         return broadcastRoom(room);
@@ -244,6 +244,7 @@ wss.on('connection', ws => {
         if (room.started) return;
         if (room.members.length < 2) return send(ws, { t: 'error', msg: 'Başlamak için en az 2 kişi gerekli.' });
         room.rounds = Math.min(10, Math.max(1, Math.floor(Number(m.rounds)) || 3));
+        room.diff = Math.min(3, Math.max(0, Math.floor(Number(m.diff)))) || (m.diff === 0 ? 0 : 1);
         room.round = 0; room.totals = {}; room.sumMs = {};
         return startRound(room);
       }
