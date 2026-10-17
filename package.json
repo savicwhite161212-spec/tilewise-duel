@@ -1,0 +1,15 @@
+{
+  "name": "tilewise-duel-server",
+  "version": "1.0.0",
+  "description": "Tilewise düello için 5 haneli oda kodu sunucusu",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
