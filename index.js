@@ -1,19 +1,22 @@
-// Tilewise sunucusu: isim, arkadaşlar, odalar (2-4 kişi), çok turlu düello ve puanlı sıralama.
-// Veriler bellekte tutulur; sunucu yeniden başlarsa silinir.
+// Tilewise sunucusu: isim, arkadaşlar (isim değişikliği + eski isimler), odalar (2-4 kişi),
+// çok turlu düello (zorluk ve tur sayısı), puanlı sıralama. Veriler bellekte tutulur.
 const http = require('http');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 8080;
 const ROOM_MAX = 4;
-const ROUND_PTS = [100, 70, 50, 30]; // tur sıralaması puanı (1., 2., 3., 4.)
-const TIME_BONUS_MAX = 60;           // her saniye için 1 puan: 60 sn'den hızlı çözene ek puan
-const ROUND_CAP_MS = 180000;         // bir turda en fazla 3 dk beklenir
-const BETWEEN_MS = 7000;             // turlar arası bekleme
+const ROUND_PTS = [100, 70, 50, 30];
+const TIME_BONUS_MAX = 60;
+const ROUND_CAP_MS = 180000;
+const BETWEEN_MS = 7000;
 const NAME_RE = /^[A-Za-zÇĞİÖŞÜçğıöşü0-9_]{2,12}$/;
+const PREV_KEEP = 3;
 
-const users = new Map();  // key(küçük harf) -> { name, friends:Set, incoming:Set, outgoing:Set, score, streak, wins }
-const online = new Map(); // key -> ws
-const rooms = new Map();  // code -> { code, host, members:[key], started, between, seed, done:{key:ms}, rounds, round, totals:{key:puan} }
+let seq = 0;
+const users = new Map();  // id -> { id, name, prev:[], friends:Set(id), incoming:Set(id), outgoing:Set(id), score, streak, wins }
+const nameIdx = new Map();// küçük harfli isim -> id
+const online = new Map(); // id -> ws
+const rooms = new Map();  // code -> oda
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -22,26 +25,30 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 function send(ws, o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
-function sendKey(key, o) { send(online.get(key), o); }
-function nameOf(key) { const u = users.get(key); return u ? u.name : ''; }
+function sendKey(id, o) { send(online.get(id), o); }
+function nameOf(id) { const u = users.get(id); return u ? u.name : ''; }
+function idOf(name) { return nameIdx.get(String(name || '').toLowerCase()); }
 function newCode() {
   let c;
   do { c = String(10000 + Math.floor(Math.random() * 90000)); } while (rooms.has(c));
   return c;
 }
 
-function pushFriends(key) {
-  const u = users.get(key); if (!u) return;
-  sendKey(key, {
+function pushFriends(id) {
+  const u = users.get(id); if (!u) return;
+  sendKey(id, {
     t: 'friends',
-    friends: [...u.friends].map(k => ({ name: nameOf(k), online: online.has(k) })),
+    friends: [...u.friends].map(k => {
+      const f = users.get(k);
+      return { name: f ? f.name : '', online: online.has(k), prev: f ? f.prev.slice() : [] };
+    }),
     incoming: [...u.incoming].map(nameOf),
     outgoing: [...u.outgoing].map(nameOf),
   });
 }
-function notifyFriends(key) {
-  const u = users.get(key); if (!u) return;
-  pushFriends(key);
+function notifyFriends(id) {
+  const u = users.get(id); if (!u) return;
+  pushFriends(id);
   u.friends.forEach(f => pushFriends(f));
 }
 
@@ -67,7 +74,6 @@ function startRound(room) {
   broadcastRoom(room);
 }
 
-// Oyun bitti: toplam puana göre son sıralama
 function finalize(room) {
   clearTimers(room);
   const ranks = room.members
@@ -80,7 +86,6 @@ function finalize(room) {
   broadcastRoom(room);
 }
 
-// Herkes turu bitirdiyse puanla; son tursa toplam sıralamayı gönder
 function maybeFinish(room) {
   if (!room.started || room.between || room.members.length === 0) return;
   if (!room.members.every(k => room.done[k] != null)) return;
@@ -96,7 +101,6 @@ function maybeFinish(room) {
     r.total = room.totals[r.key];
   });
   if (room.round >= room.rounds) {
-    // son turun sonucunu da göster, sonra toplam sıralama
     const last = ranks.map(r => ({ name: r.name, ms: r.ms, pts: r.pts, total: r.total }));
     room.members.forEach(k => sendKey(k, { t: 'round_result', round: room.round, rounds: room.rounds, ranks: last, next: 0 }));
     return finalize(room);
@@ -125,14 +129,14 @@ function leaveRoom(ws) {
     rooms.delete(code);
     return;
   }
-  delete room.done[ws.key]; delete room.totals[ws.key];
+  delete room.done[ws.key]; delete room.totals[ws.key]; delete room.sumMs[ws.key];
   broadcastRoom(room);
   maybeFinish(room);
 }
 
 function frAdd(ws, me, toName) {
-  const tk = toName.toLowerCase();
-  const t = users.get(tk);
+  const tk = idOf(toName);
+  const t = tk && users.get(tk);
   if (!t) return send(ws, { t: 'error', msg: 'Kullanıcı bulunamadı.' });
   if (tk === ws.key) return send(ws, { t: 'error', msg: 'Kendini ekleyemezsin.' });
   if (me.friends.has(tk)) return send(ws, { t: 'error', msg: 'Zaten arkadaşsınız.' });
@@ -143,21 +147,21 @@ function frAdd(ws, me, toName) {
   notifyFriends(tk); notifyFriends(ws.key);
 }
 function frAccept(ws, me, fromName) {
-  const fk = fromName.toLowerCase(), f = users.get(fk);
+  const fk = idOf(fromName), f = fk && users.get(fk);
   if (!f || !me.incoming.has(fk)) return send(ws, { t: 'error', msg: 'İstek bulunamadı.' });
   me.incoming.delete(fk); f.outgoing.delete(ws.key);
   me.friends.add(fk); f.friends.add(ws.key);
   notifyFriends(fk); notifyFriends(ws.key);
 }
 function frReject(ws, me, fromName) {
-  const fk = fromName.toLowerCase(), f = users.get(fk);
-  me.incoming.delete(fk);
+  const fk = idOf(fromName), f = fk && users.get(fk);
+  if (fk) me.incoming.delete(fk);
   if (f) f.outgoing.delete(ws.key);
   notifyFriends(fk); notifyFriends(ws.key);
 }
 function frRemove(ws, me, name) {
-  const fk = name.toLowerCase(), f = users.get(fk);
-  me.friends.delete(fk);
+  const fk = idOf(name), f = fk && users.get(fk);
+  if (fk) me.friends.delete(fk);
   if (f) f.friends.delete(ws.key);
   notifyFriends(fk); notifyFriends(ws.key);
 }
@@ -166,13 +170,35 @@ function hello(ws, m) {
   if (ws.key) return send(ws, { t: 'hello_ok', name: nameOf(ws.key) });
   const name = String(m.name || '').trim();
   if (!NAME_RE.test(name)) return send(ws, { t: 'error', msg: 'İsim 2-12 harf ya da rakam olmalı.' });
-  const key = name.toLowerCase();
-  if (online.has(key) && online.get(key) !== ws) return send(ws, { t: 'error', msg: 'Bu isim şu an kullanımda.' });
-  if (!users.has(key)) users.set(key, { name, friends: new Set(), incoming: new Set(), outgoing: new Set(), score: 0, streak: 0, wins: 0 });
-  ws.key = key;
-  online.set(key, ws);
-  send(ws, { t: 'hello_ok', name: users.get(key).name });
-  notifyFriends(key);
+  let id = idOf(name);
+  if (id && online.has(id) && online.get(id) !== ws) return send(ws, { t: 'error', msg: 'Bu isim şu an kullanımda.' });
+  if (!id) {
+    id = 'u' + (++seq);
+    users.set(id, { id, name, prev: [], friends: new Set(), incoming: new Set(), outgoing: new Set(), score: 0, streak: 0, wins: 0 });
+    nameIdx.set(name.toLowerCase(), id);
+  }
+  ws.key = id;
+  online.set(id, ws);
+  send(ws, { t: 'hello_ok', name: users.get(id).name });
+  notifyFriends(id);
+}
+
+// Ad değiştirme: arkadaşlıklar ve skorlar korunur, eski isim "prev" listesine girer
+function rename(ws, me, newName) {
+  const name = String(newName || '').trim();
+  if (!NAME_RE.test(name)) return send(ws, { t: 'error', msg: 'İsim 2-12 harf ya da rakam olmalı.' });
+  const lk = name.toLowerCase();
+  const owner = nameIdx.get(lk);
+  if (owner && owner !== ws.key) return send(ws, { t: 'error', msg: 'Bu kullanıcı adı başka biri tarafından alınmış.' });
+  if (me.name === name) return send(ws, { t: 'renamed', name });
+  me.prev.push(me.name); if (me.prev.length > PREV_KEEP) me.prev = me.prev.slice(-PREV_KEEP);
+  nameIdx.delete(me.name.toLowerCase());
+  me.name = name;
+  nameIdx.set(lk, ws.key);
+  send(ws, { t: 'renamed', name });
+  const touch = new Set([ws.key, ...me.friends, ...me.incoming, ...me.outgoing]);
+  touch.forEach(k => pushFriends(k));
+  if (ws.room) { const r = rooms.get(ws.room); if (r) broadcastRoom(r); }
 }
 
 function sendLb(ws, field) {
@@ -193,6 +219,7 @@ wss.on('connection', ws => {
     let m;
     try { m = JSON.parse(raw); } catch (e) { return; }
     if (m.t === 'hello') return hello(ws, m);
+    if (m.t === 'ping') return;
     if (!ws.key) return send(ws, { t: 'error', msg: 'Önce isim seç.' });
     const me = users.get(ws.key);
 
@@ -201,6 +228,8 @@ wss.on('connection', ws => {
       case 'fr_accept': return frAccept(ws, me, String(m.from || ''));
       case 'fr_reject': return frReject(ws, me, String(m.from || ''));
       case 'fr_remove': return frRemove(ws, me, String(m.from || ''));
+      case 'refresh': return pushFriends(ws.key);
+      case 'rename': return rename(ws, me, m.name);
       case 'stats':
         me.score = Math.max(me.score, Number(m.score) || 0);
         me.streak = Math.max(me.streak, Number(m.streak) || 0);
@@ -233,8 +262,8 @@ wss.on('connection', ws => {
       case 'invite': {
         const room = rooms.get(ws.room);
         if (!room) return send(ws, { t: 'error', msg: 'Önce bir oda kur.' });
-        const tk = String(m.to || '').toLowerCase();
-        if (!me.friends.has(tk) || !online.has(tk)) return send(ws, { t: 'error', msg: 'Arkadaş çevrimiçi değil.' });
+        const tk = idOf(m.to);
+        if (!tk || !me.friends.has(tk) || !online.has(tk)) return send(ws, { t: 'error', msg: 'Arkadaş çevrimiçi değil.' });
         if (room.members.length >= ROOM_MAX) return send(ws, { t: 'error', msg: 'Oda dolu.' });
         return sendKey(tk, { t: 'invite', from: me.name, code: room.code });
       }
@@ -244,7 +273,8 @@ wss.on('connection', ws => {
         if (room.started) return;
         if (room.members.length < 2) return send(ws, { t: 'error', msg: 'Başlamak için en az 2 kişi gerekli.' });
         room.rounds = Math.min(10, Math.max(1, Math.floor(Number(m.rounds)) || 3));
-        room.diff = Math.min(3, Math.max(0, Math.floor(Number(m.diff)))) || (m.diff === 0 ? 0 : 1);
+        const d = Math.floor(Number(m.diff));
+        room.diff = d >= 0 && d <= 3 ? d : 1;
         room.round = 0; room.totals = {}; room.sumMs = {};
         return startRound(room);
       }
@@ -265,8 +295,9 @@ wss.on('connection', ws => {
     if (!ws.key) return;
     leaveRoom(ws);
     if (online.get(ws.key) === ws) {
-      online.delete(ws.key);
-      notifyFriends(ws.key);
+      const id = ws.key;
+      online.delete(id);
+      notifyFriends(id);
     }
   });
 });
